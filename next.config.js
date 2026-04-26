@@ -9,4 +9,4 @@ const nextConfig = {
   output: 'standalone',
 };
 
-module.exports = nextConfig;a
+module.exports = nextConfig;

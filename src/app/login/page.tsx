@@ -190,4 +190,4 @@ const styles: Record<string, React.CSSProperties> = {
     color: 'var(--text-dim)',
     fontFamily: "'DM Mono', monospace",
   },
-}; 
+};
