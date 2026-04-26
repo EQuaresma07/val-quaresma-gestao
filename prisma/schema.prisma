@@ -1,0 +1,671 @@
+// ============================================================
+//  SISTEMA DE GESTÃO — LOJA DE ROUPAS
+//  Banco:    PostgreSQL 15+
+//  ORM:      Prisma
+//  Princípios: integridade referencial, auditoria, soft-delete,
+//              índices estratégicos, valores monetários precisos
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+//  ENUMS
+// ============================================================
+
+enum PaymentMethod {
+  CASH          // Dinheiro
+  CREDIT_CARD   // Cartão de crédito
+  DEBIT_CARD    // Cartão de débito
+  PIX           // Pix
+  STORE_CREDIT  // Fiado (crédito da loja)
+  BANK_TRANSFER // Transferência
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING   // Aguardando pagamento
+  PARTIAL   // Parcialmente pago
+  PAID      // Quitado
+  OVERDUE   // Em atraso
+  CANCELLED // Cancelado
+}
+
+enum SaleStatus {
+  DRAFT          // Em edição (carrinho)
+  COMPLETED      // Finalizada
+  CANCELLED      // Cancelada
+  PARTIAL_RETURN // Devolução parcial
+  FULL_RETURN    // Devolução total
+}
+
+enum StockMovementType {
+  ENTRY        // Entrada por compra
+  SALE         // Saída por venda
+  RETURN_IN    // Devolução cliente -> volta ao estoque
+  RETURN_OUT   // Devolução ao fornecedor
+  ADJUSTMENT   // Ajuste manual (perda, contagem, dano)
+  TRANSFER_IN  // Reservado p/ futuras filiais
+  TRANSFER_OUT
+  INITIAL      // Estoque inicial cadastrado
+}
+
+enum CashFlowType {
+  INCOME  // Entrada
+  EXPENSE // Saída
+}
+
+enum CashFlowSource {
+  SALE          // Venda
+  INSTALLMENT   // Recebimento de parcela
+  SUPPLIER      // Pagamento a fornecedor
+  RENT          // Aluguel
+  PAYROLL       // Folha de pagamento
+  UTILITIES     // Contas (luz, água, etc)
+  TAX           // Impostos
+  MARKETING     // Marketing
+  RETURN        // Devolução de venda
+  OTHER         // Outros
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  UNISEX
+  KIDS
+}
+
+enum UserRole {
+  ADMIN
+  CASHIER
+  STOCK_MANAGER
+}
+
+// ============================================================
+//  USUÁRIOS DO SISTEMA
+//  (Mesmo sendo 1 usuário hoje, deixar pronto evita refactor)
+// ============================================================
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String   @db.VarChar(100)
+  email        String   @unique @db.VarChar(150)
+  passwordHash String   @map("password_hash") @db.VarChar(255)
+  role         UserRole @default(ADMIN)
+  isActive     Boolean  @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  salesCreated         Sale[]            @relation("SaleCreatedBy")
+  stockEntries         StockEntry[]
+  stockMovements       StockMovement[]
+  cashFlowEntries      CashFlow[]
+  installmentsReceived Installment[]     @relation("InstallmentReceivedBy")
+  returns              Return[]
+
+  @@index([email])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+// ============================================================
+//  CATEGORIAS (hierárquicas: Feminino > Vestidos > Florais)
+// ============================================================
+
+model Category {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String  @db.VarChar(80)
+  slug        String  @unique @db.VarChar(100)
+  description String? @db.Text
+  parentId    String? @map("parent_id") @db.Uuid
+
+  parent   Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
+  children Category[] @relation("CategoryHierarchy")
+  products Product[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([parentId])
+  @@index([slug])
+  @@index([deletedAt])
+  @@map("categories")
+}
+
+// ============================================================
+//  TAMANHOS E CORES (tabelas de referência)
+// ============================================================
+
+model Size {
+  id           String  @id @default(uuid()) @db.Uuid
+  name         String  @unique @db.VarChar(20)  // PP, P, M, G, GG, 36, 38, 40...
+  displayOrder Int     @default(0) @map("display_order")
+  category     String? @db.VarChar(30) // "letter" | "numeric" | "shoe"
+
+  variants ProductVariant[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([displayOrder])
+  @@map("sizes")
+}
+
+model Color {
+  id      String  @id @default(uuid()) @db.Uuid
+  name    String  @unique @db.VarChar(40)
+  hexCode String? @map("hex_code") @db.VarChar(7) // #FFFFFF para preview na UI
+
+  variants ProductVariant[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@map("colors")
+}
+
+// ============================================================
+//  PRODUTOS  (modelo "pai" — não tem estoque direto)
+//  O estoque vive nas variantes (combinação tamanho + cor)
+// ============================================================
+
+model Product {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String  @db.VarChar(150)
+  description String? @db.Text
+  brand       String? @db.VarChar(80)
+  gender      Gender  @default(UNISEX)
+
+  sku       String? @unique @db.VarChar(50)
+  barcode   String? @unique @db.VarChar(50)
+  imageUrl  String? @map("image_url") @db.VarChar(500)
+
+  categoryId String   @map("category_id") @db.Uuid
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  // Preço SUGERIDO de venda (cada variante pode sobrescrever)
+  suggestedPrice Decimal @map("suggested_price") @db.Decimal(12, 2)
+
+  isActive Boolean @default(true) @map("is_active")
+
+  variants ProductVariant[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([categoryId])
+  @@index([name])
+  @@index([sku])
+  @@index([barcode])
+  @@index([isActive, deletedAt])
+  @@map("products")
+}
+
+// ============================================================
+//  VARIANTES DE PRODUTO  ⭐ CORAÇÃO DO SISTEMA
+//  Cada combinação tamanho + cor é uma variante única.
+//  É AQUI que está o estoque, o preço final, o código de barras.
+// ============================================================
+
+model ProductVariant {
+  id        String @id @default(uuid()) @db.Uuid
+  productId String @map("product_id") @db.Uuid
+  sizeId    String @map("size_id") @db.Uuid
+  colorId   String @map("color_id") @db.Uuid
+
+  sku     String  @unique @db.VarChar(60)
+  barcode String? @unique @db.VarChar(60)
+
+  // Preços (Decimal evita problemas de ponto flutuante com dinheiro)
+  costPrice    Decimal @map("cost_price") @db.Decimal(12, 2)
+  sellingPrice Decimal @map("selling_price") @db.Decimal(12, 2)
+
+  // Estoque (denormalizado pra performance — atualizado em transação)
+  stockQuantity    Int @default(0) @map("stock_quantity")
+  reservedQuantity Int @default(0) @map("reserved_quantity")
+  minStockAlert    Int @default(3) @map("min_stock_alert")
+
+  isActive Boolean @default(true) @map("is_active")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+  size    Size    @relation(fields: [sizeId], references: [id], onDelete: Restrict)
+  color   Color   @relation(fields: [colorId], references: [id], onDelete: Restrict)
+
+  saleItems       SaleItem[]
+  stockEntryItems StockEntryItem[]
+  stockMovements  StockMovement[]
+  returnItems     ReturnItem[]
+  priceHistory    PriceHistory[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  // Garante que não existem 2 variantes iguais (mesmo produto + tamanho + cor)
+  @@unique([productId, sizeId, colorId], name: "unique_product_variant")
+  @@index([productId])
+  @@index([stockQuantity])
+  @@index([sku])
+  @@index([barcode])
+  @@index([isActive, deletedAt])
+  @@map("product_variants")
+}
+
+// ============================================================
+//  HISTÓRICO DE PREÇOS
+// ============================================================
+
+model PriceHistory {
+  id        String @id @default(uuid()) @db.Uuid
+  variantId String @map("variant_id") @db.Uuid
+
+  oldCostPrice    Decimal? @map("old_cost_price") @db.Decimal(12, 2)
+  newCostPrice    Decimal? @map("new_cost_price") @db.Decimal(12, 2)
+  oldSellingPrice Decimal? @map("old_selling_price") @db.Decimal(12, 2)
+  newSellingPrice Decimal? @map("new_selling_price") @db.Decimal(12, 2)
+
+  reason String? @db.VarChar(255)
+
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([variantId, createdAt])
+  @@map("price_history")
+}
+
+// ============================================================
+//  FORNECEDORES
+// ============================================================
+
+model Supplier {
+  id        String  @id @default(uuid()) @db.Uuid
+  name      String  @db.VarChar(150)
+  legalName String? @map("legal_name") @db.VarChar(150)
+  document  String? @unique @db.VarChar(20) // CNPJ / CPF
+  email     String? @db.VarChar(150)
+  phone     String? @db.VarChar(20)
+
+  addressStreet       String? @map("address_street") @db.VarChar(150)
+  addressNumber       String? @map("address_number") @db.VarChar(20)
+  addressComplement   String? @map("address_complement") @db.VarChar(100)
+  addressNeighborhood String? @map("address_neighborhood") @db.VarChar(100)
+  addressCity         String? @map("address_city") @db.VarChar(100)
+  addressState        String? @map("address_state") @db.VarChar(2)
+  addressZipCode      String? @map("address_zip_code") @db.VarChar(10)
+
+  notes String? @db.Text
+
+  stockEntries StockEntry[]
+  cashFlows    CashFlow[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([name])
+  @@index([document])
+  @@index([deletedAt])
+  @@map("suppliers")
+}
+
+// ============================================================
+//  CLIENTES
+// ============================================================
+
+model Customer {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String    @db.VarChar(150)
+  document  String?   @unique @db.VarChar(20)
+  email     String?   @db.VarChar(150)
+  phone     String?   @db.VarChar(20)
+  birthDate DateTime? @map("birth_date") @db.Date
+
+  addressStreet       String? @map("address_street") @db.VarChar(150)
+  addressNumber       String? @map("address_number") @db.VarChar(20)
+  addressComplement   String? @map("address_complement") @db.VarChar(100)
+  addressNeighborhood String? @map("address_neighborhood") @db.VarChar(100)
+  addressCity         String? @map("address_city") @db.VarChar(100)
+  addressState        String? @map("address_state") @db.VarChar(2)
+  addressZipCode      String? @map("address_zip_code") @db.VarChar(10)
+
+  // Limite de fiado (opcional)
+  creditLimit Decimal @default(0) @map("credit_limit") @db.Decimal(12, 2)
+  currentDebt Decimal @default(0) @map("current_debt") @db.Decimal(12, 2)
+
+  notes String? @db.Text
+
+  sales        Sale[]
+  installments Installment[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([name])
+  @@index([document])
+  @@index([phone])
+  @@index([deletedAt])
+  @@map("customers")
+}
+
+// ============================================================
+//  ENTRADAS DE ESTOQUE (compra do fornecedor)
+// ============================================================
+
+model StockEntry {
+  id            String   @id @default(uuid()) @db.Uuid
+  invoiceNumber String?  @map("invoice_number") @db.VarChar(50)
+  supplierId    String   @map("supplier_id") @db.Uuid
+  userId        String   @map("user_id") @db.Uuid
+  entryDate     DateTime @map("entry_date")
+  totalCost     Decimal  @map("total_cost") @db.Decimal(12, 2)
+  notes         String?  @db.Text
+
+  supplier Supplier         @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  user     User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  items    StockEntryItem[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([supplierId])
+  @@index([entryDate])
+  @@index([invoiceNumber])
+  @@map("stock_entries")
+}
+
+model StockEntryItem {
+  id           String  @id @default(uuid()) @db.Uuid
+  stockEntryId String  @map("stock_entry_id") @db.Uuid
+  variantId    String  @map("variant_id") @db.Uuid
+  quantity     Int
+  unitCost     Decimal @map("unit_cost") @db.Decimal(12, 2)
+  subtotal     Decimal @db.Decimal(12, 2)
+
+  stockEntry StockEntry     @relation(fields: [stockEntryId], references: [id], onDelete: Cascade)
+  variant    ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([stockEntryId])
+  @@index([variantId])
+  @@map("stock_entry_items")
+}
+
+// ============================================================
+//  VENDAS
+// ============================================================
+
+model Sale {
+  id         String     @id @default(uuid()) @db.Uuid
+  saleNumber Int        @unique @default(autoincrement()) @map("sale_number")
+  customerId String?    @map("customer_id") @db.Uuid
+  userId     String     @map("user_id") @db.Uuid
+  saleDate   DateTime   @default(now()) @map("sale_date")
+  status     SaleStatus @default(COMPLETED)
+
+  subtotal       Decimal @db.Decimal(12, 2)
+  discountAmount Decimal @default(0) @map("discount_amount") @db.Decimal(12, 2)
+  discountReason String? @map("discount_reason") @db.VarChar(255)
+  total          Decimal @db.Decimal(12, 2)
+
+  paymentStatus PaymentStatus @default(PAID) @map("payment_status")
+  amountPaid    Decimal       @default(0) @map("amount_paid") @db.Decimal(12, 2)
+
+  notes String? @db.Text
+
+  customer     Customer?     @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  user         User          @relation("SaleCreatedBy", fields: [userId], references: [id], onDelete: Restrict)
+  items        SaleItem[]
+  payments     SalePayment[]
+  installments Installment[]
+  returns      Return[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([customerId])
+  @@index([userId])
+  @@index([saleDate])
+  @@index([status])
+  @@index([paymentStatus])
+  @@index([saleNumber])
+  @@map("sales")
+}
+
+model SaleItem {
+  id        String @id @default(uuid()) @db.Uuid
+  saleId    String @map("sale_id") @db.Uuid
+  variantId String @map("variant_id") @db.Uuid
+
+  quantity Int
+
+  // ⭐ Snapshot do preço no momento da venda
+  unitPrice      Decimal @map("unit_price") @db.Decimal(12, 2)
+  unitCost       Decimal @map("unit_cost") @db.Decimal(12, 2)
+  discountAmount Decimal @default(0) @map("discount_amount") @db.Decimal(12, 2)
+  subtotal       Decimal @db.Decimal(12, 2)
+
+  // Para devoluções parciais
+  returnedQuantity Int @default(0) @map("returned_quantity")
+
+  sale        Sale           @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  variant     ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  returnItems ReturnItem[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([saleId])
+  @@index([variantId])
+  @@map("sale_items")
+}
+
+// ============================================================
+//  PAGAMENTOS DA VENDA
+//  Uma venda pode ter MÚLTIPLOS pagamentos (pix + cartão por ex.)
+// ============================================================
+
+model SalePayment {
+  id     String        @id @default(uuid()) @db.Uuid
+  saleId String        @map("sale_id") @db.Uuid
+  method PaymentMethod
+  amount Decimal       @db.Decimal(12, 2)
+
+  installments      Int     @default(1)
+  authorizationCode String? @map("authorization_code") @db.VarChar(50)
+
+  paidAt DateTime @default(now()) @map("paid_at")
+
+  sale Sale @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([saleId])
+  @@index([method])
+  @@index([paidAt])
+  @@map("sale_payments")
+}
+
+// ============================================================
+//  PARCELAS DE FIADO
+// ============================================================
+
+model Installment {
+  id                String   @id @default(uuid()) @db.Uuid
+  saleId            String   @map("sale_id") @db.Uuid
+  customerId        String   @map("customer_id") @db.Uuid
+  installmentNumber Int      @map("installment_number")
+  totalInstallments Int      @map("total_installments")
+  dueDate           DateTime @map("due_date") @db.Date
+  amount            Decimal  @db.Decimal(12, 2)
+  amountPaid        Decimal  @default(0) @map("amount_paid") @db.Decimal(12, 2)
+  status            PaymentStatus @default(PENDING)
+
+  paidAt        DateTime?      @map("paid_at")
+  paidByUserId  String?        @map("paid_by_user_id") @db.Uuid
+  paymentMethod PaymentMethod? @map("payment_method")
+  notes         String?        @db.Text
+
+  sale       Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  paidByUser User?    @relation("InstallmentReceivedBy", fields: [paidByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([saleId])
+  @@index([customerId])
+  @@index([dueDate])
+  @@index([status])
+  @@index([status, dueDate])
+  @@map("installments")
+}
+
+// ============================================================
+//  DEVOLUÇÕES E TROCAS
+// ============================================================
+
+model Return {
+  id           String   @id @default(uuid()) @db.Uuid
+  returnNumber Int      @unique @default(autoincrement()) @map("return_number")
+  saleId       String   @map("sale_id") @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  returnDate   DateTime @default(now()) @map("return_date")
+
+  // REFUND | EXCHANGE | STORE_CREDIT
+  type   String  @db.VarChar(20)
+  reason String? @db.Text
+
+  refundAmount Decimal        @map("refund_amount") @db.Decimal(12, 2)
+  refundMethod PaymentMethod? @map("refund_method")
+
+  // Se for troca, aponta para a NOVA venda gerada
+  exchangeSaleId String? @map("exchange_sale_id") @db.Uuid
+
+  notes String? @db.Text
+
+  sale  Sale         @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  user  User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  items ReturnItem[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([saleId])
+  @@index([returnDate])
+  @@index([type])
+  @@map("returns")
+}
+
+model ReturnItem {
+  id         String @id @default(uuid()) @db.Uuid
+  returnId   String @map("return_id") @db.Uuid
+  saleItemId String @map("sale_item_id") @db.Uuid
+  variantId  String @map("variant_id") @db.Uuid
+
+  quantity  Int
+  unitPrice Decimal @map("unit_price") @db.Decimal(12, 2)
+  subtotal  Decimal @db.Decimal(12, 2)
+
+  // NEW, USED, DAMAGED
+  condition       String? @db.VarChar(50)
+  returnedToStock Boolean @default(true) @map("returned_to_stock")
+
+  return   Return         @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  saleItem SaleItem       @relation(fields: [saleItemId], references: [id], onDelete: Restrict)
+  variant  ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([returnId])
+  @@index([saleItemId])
+  @@index([variantId])
+  @@map("return_items")
+}
+
+// ============================================================
+//  MOVIMENTAÇÕES DE ESTOQUE  ⭐ LIVRO-CAIXA DO ESTOQUE
+//  Toda alteração de quantidade gera UMA linha aqui.
+// ============================================================
+
+model StockMovement {
+  id        String            @id @default(uuid()) @db.Uuid
+  variantId String            @map("variant_id") @db.Uuid
+  type      StockMovementType
+  quantity  Int               // Positivo = entrada / Negativo = saída
+
+  // Saldo APÓS o movimento (snapshot facilita auditoria)
+  balanceAfter Int @map("balance_after")
+
+  // Referência para a origem do movimento
+  referenceType String? @map("reference_type") @db.VarChar(30)
+  referenceId   String? @map("reference_id") @db.Uuid
+
+  reason String? @db.Text
+  userId String @map("user_id") @db.Uuid
+
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  user    User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([variantId, createdAt])
+  @@index([type])
+  @@index([referenceType, referenceId])
+  @@index([createdAt])
+  @@map("stock_movements")
+}
+
+// ============================================================
+//  FLUXO DE CAIXA  ⭐ LIVRO-CAIXA DO DINHEIRO
+// ============================================================
+
+model CashFlow {
+  id          String         @id @default(uuid()) @db.Uuid
+  type        CashFlowType
+  source      CashFlowSource
+  amount      Decimal        @db.Decimal(12, 2)
+  description String         @db.VarChar(255)
+  occurredAt  DateTime       @map("occurred_at")
+
+  paymentMethod PaymentMethod? @map("payment_method")
+
+  saleId        String? @map("sale_id") @db.Uuid
+  installmentId String? @map("installment_id") @db.Uuid
+  supplierId    String? @map("supplier_id") @db.Uuid
+  stockEntryId  String? @map("stock_entry_id") @db.Uuid
+  returnId      String? @map("return_id") @db.Uuid
+
+  userId String  @map("user_id") @db.Uuid
+  notes  String? @db.Text
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  supplier Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([type])
+  @@index([source])
+  @@index([occurredAt])
+  @@index([saleId])
+  @@index([installmentId])
+  @@index([type, occurredAt])
+  @@map("cash_flow")
+}
