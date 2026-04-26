@@ -44,12 +44,3 @@ export async function POST(request: NextRequest) {
     );
   }
 }
-
-// Aumenta o limite de payload para suportar imagens
-export const config = {
-  api: {
-    bodyParser: {
-      sizeLimit: '10mb',
-    },
-  },
-};
