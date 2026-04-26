@@ -6,6 +6,7 @@ const nextConfig = {
       allowedOrigins: ['localhost:3000'],
     },
   },
+  output: 'standalone',
 };
 
-module.exports = nextConfig;
+module.exports = nextConfig;a
